@@ -1,5 +1,13 @@
 # Supervised Contrastive Multimodal Learning for Clinically Feasible Alzheimer's Disease Classification
 
+> Official implementation — MICCAI 2025 (anonymized submission)
+
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+
+---
+
 ## Overview
 
 We propose a clinically feasible multimodal framework for three-class Alzheimer's disease staging (**CN / MCI / AD**) that integrates **structural MRI (sMRI)** and **routinely collected tabular clinical data**, avoiding costly or invasive modalities such as PET, CSF biomarkers, or genomic profiling.
@@ -17,6 +25,7 @@ Experiments on **ADNI** (n = 1,044) demonstrate performance comparable to SOTA m
 
 ## Architecture
 
+![Architecture](assets/architecture.png)
 
 **MRI branch** — 2D axial slices (skull-stripped, 448×448, normalised to [−1, 1]). Central slices targeting medial temporal lobe, hippocampal structures, and ventricular areas are selected automatically. Slice embeddings are mean-pooled per patient.
 
@@ -70,6 +79,20 @@ Experiments on **ADNI** (n = 1,044) demonstrate performance comparable to SOTA m
 └── config_<RUN_ID>.json            # Saved run configuration and results
 ```
 
+---
+
+## Installation
+
+```bash
+git clone https://github.com/[anonymized]/Supervised-Contrastive-Learning-for-Alzheimer-s-Disease-Classification.git
+cd Supervised-Contrastive-Learning-for-Alzheimer-s-Disease-Classification
+
+pip install torch torchvision transformers scikit-learn lightgbm xgboost pandas numpy matplotlib tqdm
+```
+
+Tested on Python 3.9+, PyTorch 2.0+, CUDA 11.8+. All experiments were run on an **NVIDIA A100-SXM4-40GB**.
+
+---
 
 ## Data
 
@@ -195,6 +218,33 @@ An ordinal penalty is applied: CN–AD pairs are pushed apart more strongly than
 ### Fusion
 
 MRI embeddings (512-d) and tabular embeddings (256-d) are concatenated into a 768-d joint representation, which is passed through a 3-layer MLP classifier. The vision encoder's last 2 transformer blocks receive gradients during fusion training (at 5% of the fusion learning rate), enabling end-to-end adaptation while preserving pretrained structural representations.
+
+---
+
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@inproceedings{anonymized2025supcon_ad,
+  title     = {Supervised Contrastive Multimodal Learning for Clinically Feasible Alzheimer's Disease Classification},
+  booktitle = {Medical Image Computing and Computer-Assisted Intervention (MICCAI)},
+  year      = {2025},
+  note      = {Anonymized for review}
+}
+```
+
+---
+
+## Acknowledgements
+
+Data were provided by the **Alzheimer's Disease Neuroimaging Initiative (ADNI)**. ADNI is funded by the National Institute on Aging, the National Institute of Biomedical Imaging and Bioengineering, and through contributions from the following: AbbVie, Alzheimer's Association, Alzheimer's Drug Discovery Foundation, Araclon Biotech, BioClinica, Inc., and others.
+
+This work builds on:
+- [DINO](https://github.com/facebookresearch/dino) — Caron et al., ICCV 2021
+- [MedSigLIP / MedGemma](https://arxiv.org/abs/2507.05201) — Sellergren et al., 2025
+- [SupCon](https://github.com/HobbitLong/SupContrast) — Khosla et al., NeurIPS 2020
+- [DeepGBM](https://dl.acm.org/doi/10.1145/3292500.3330858) — Ke et al., KDD 2019
 
 ---
 
