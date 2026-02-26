@@ -1,0 +1,396 @@
+# !pip install -q lightgbm xgboost
+
+import datetime
+import json
+import os
+import random
+import warnings
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import xgboost as xgb
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    roc_auc_score,
+)
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device : {device}")
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+TRAIN_CSV  = "data/tabular/train.csv"
+VAL_CSV    = "data/tabular/val.csv"
+TEST_CSV   = "data/tabular/test.csv"
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+RUN_ID      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+NUM_CLASSES = 3
+CLASS_NAMES = ["CN", "MCI", "AD"]
+MCI_BOOST   = 1.8
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+def _remap(df: pd.DataFrame) -> pd.DataFrame:
+    if set(df["DIAGNOSIS"].dropna().unique()) <= {1, 2, 3}:
+        df["DIAGNOSIS"] = df["DIAGNOSIS"].map({1: 0, 2: 1, 3: 2})
+    df = df.dropna(subset=["DIAGNOSIS"]).copy()
+    df["DIAGNOSIS"] = df["DIAGNOSIS"].astype(int)
+    return df[df["DIAGNOSIS"].isin([0, 1, 2])].copy()
+
+
+def load_csv(path: str, name: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["subject_id"] = df["subject_id"].astype(str)
+    df = _remap(df).drop_duplicates("subject_id").set_index("subject_id")
+    print(f"  {name}: {len(df):>4d}  {np.bincount(df['DIAGNOSIS'].values, minlength=3)}")
+    return df
+
+
+print("Loading data ...")
+train_df = load_csv(TRAIN_CSV, "train")
+val_df   = load_csv(VAL_CSV,   "val")
+test_df  = load_csv(TEST_CSV,  "test")
+
+y_tr = train_df["DIAGNOSIS"].values.astype(int)
+y_va = val_df["DIAGNOSIS"].values.astype(int)
+y_te = test_df["DIAGNOSIS"].values.astype(int)
+
+X_tr = train_df.drop(columns=["DIAGNOSIS"]).copy()
+X_va = val_df.drop(columns=["DIAGNOSIS"]).copy()
+X_te = test_df.drop(columns=["DIAGNOSIS"]).copy()
+
+
+def _safe_le(le: LabelEncoder, s: pd.Series) -> np.ndarray:
+    known = set(le.classes_); fb = le.classes_[0]
+    return np.array([le.transform([v])[0] if v in known
+                     else le.transform([fb])[0] for v in s.astype(str)])
+
+
+for col in X_tr.columns:
+    if X_tr[col].dtype == "object":
+        le = LabelEncoder().fit(X_tr[col].astype(str))
+        X_tr[col] = le.transform(X_tr[col].astype(str))
+        X_va[col] = _safe_le(le, X_va[col])
+        X_te[col] = _safe_le(le, X_te[col])
+
+scaler  = StandardScaler()
+X_tr_np = scaler.fit_transform(X_tr.values.astype(np.float32))
+X_va_np = scaler.transform(X_va.values.astype(np.float32))
+X_te_np = scaler.transform(X_te.values.astype(np.float32))
+
+cc_tr   = np.bincount(y_tr, minlength=NUM_CLASSES).astype(np.float32)
+sw_tr   = np.array([1.0 / max(cc_tr[l], 1) for l in y_tr])
+sw_tr[y_tr == 1] *= MCI_BOOST
+
+cw_nn   = 1.0 / np.maximum(cc_tr, 1); cw_nn[1] *= MCI_BOOST
+cw_nn   = torch.tensor(cw_nn / cw_nn.sum() * NUM_CLASSES, dtype=torch.float32).to(device)
+
+print(f"\n  Feature dim : {X_tr_np.shape[1]}\n")
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+def compute_auprc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Macro-averaged AUPRC via one-vs-rest binarisation."""
+    y_bin = label_binarize(y_true, classes=list(range(NUM_CLASSES)))
+    return float(np.mean([
+        average_precision_score(y_bin[:, c], y_prob[:, c])
+        for c in range(NUM_CLASSES)
+    ]))
+
+
+def report(tag: str, y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) -> dict:
+    m = dict(
+        acc      = accuracy_score(y_true, y_pred),
+        f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0),
+        auroc    = roc_auc_score(y_true, y_prob, multi_class="ovr", average="macro"),
+        auprc    = compute_auprc(y_true, y_prob),
+        mcc      = matthews_corrcoef(y_true, y_pred),
+    )
+    per_cls = {
+        cn: float((y_pred[y_true == c] == c).mean()) if (y_true == c).sum() else 0.0
+        for c, cn in enumerate(CLASS_NAMES)
+    }
+    print(f"\n[{tag}]")
+    print(f"  {'Accuracy':>10s}: {m['acc']:.4f}")
+    print(f"  {'F1 (macro)':>10s}: {m['f1_macro']:.4f}")
+    print(f"  {'AUROC':>10s}: {m['auroc']:.4f}")
+    print(f"  {'AUPRC':>10s}: {m['auprc']:.4f}")
+    print(f"  {'MCC':>10s}: {m['mcc']:.4f}")
+    print(f"\n  Per-class recall:  " +
+          "  ".join(f"{cn} {v:.3f}" for cn, v in per_cls.items()))
+    print(f"\n  Confusion matrix:\n{confusion_matrix(y_true, y_pred)}")
+    print(f"\n{classification_report(y_true, y_pred, target_names=CLASS_NAMES)}")
+    return {**m, **{f"{cn.lower()}_recall": v for cn, v in per_cls.items()}}
+
+
+all_results: dict = {}
+
+# ---------------------------------------------------------------------------
+# 1. LightGBM
+# ---------------------------------------------------------------------------
+print("=" * 55)
+print("  1 / 4  LightGBM")
+print("=" * 55)
+
+lgb_clf = lgb.LGBMClassifier(
+    objective="multiclass", num_class=NUM_CLASSES, metric="multi_logloss",
+    learning_rate=0.05, num_leaves=63, min_child_samples=10,
+    subsample=0.8, colsample_bytree=0.8,
+    reg_alpha=0.1, reg_lambda=1.0,
+    n_estimators=1000, class_weight="balanced",
+    random_state=SEED, verbose=-1, n_jobs=-1,
+)
+lgb_clf.fit(
+    X_tr_np, y_tr,
+    eval_set=[(X_va_np, y_va)],
+    callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(period=-1)],
+)
+lgb_prob = lgb_clf.predict_proba(X_te_np)
+lgb_pred = lgb_prob.argmax(1)
+all_results["LightGBM"] = report("LightGBM", y_te, lgb_pred, lgb_prob)
+
+# ---------------------------------------------------------------------------
+# 2. XGBoost
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 55)
+print("  2 / 4  XGBoost")
+print("=" * 55)
+
+xgb_clf = xgb.XGBClassifier(
+    objective="multi:softprob", num_class=NUM_CLASSES, eval_metric="mlogloss",
+    learning_rate=0.05, max_depth=6,
+    n_estimators=1000, subsample=0.8, colsample_bytree=0.8,
+    reg_alpha=0.1, reg_lambda=1.0,
+    use_label_encoder=False, random_state=SEED, n_jobs=-1, verbosity=0,
+)
+xgb_clf.fit(
+    X_tr_np, y_tr,
+    sample_weight=sw_tr,
+    eval_set=[(X_va_np, y_va)],
+    early_stopping_rounds=50,
+    verbose=False,
+)
+xgb_prob = xgb_clf.predict_proba(X_te_np)
+xgb_pred = xgb_prob.argmax(1)
+all_results["XGBoost"] = report("XGBoost", y_te, xgb_pred, xgb_prob)
+
+# ---------------------------------------------------------------------------
+# 3. MLP
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 55)
+print("  3 / 4  MLP")
+print("=" * 55)
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, num_classes: int = 3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 256), nn.BatchNorm1d(256), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(256,    256), nn.BatchNorm1d(256), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(256,    128), nn.BatchNorm1d(128), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(128, num_classes),
+        )
+    def forward(self, x): return self.net(x)
+
+
+def make_loader(X, y, bs, weighted=False):
+    ds = TensorDataset(torch.FloatTensor(X), torch.LongTensor(y))
+    if weighted:
+        w   = [sw_tr[i] for i in range(len(y))]
+        smp = WeightedRandomSampler(w, len(w), replacement=True)
+        return DataLoader(ds, batch_size=bs, sampler=smp)
+    return DataLoader(ds, batch_size=bs, shuffle=False)
+
+
+mlp_tr = make_loader(X_tr_np, y_tr, 128, weighted=True)
+mlp_va = make_loader(X_va_np, y_va, 256)
+mlp_te = make_loader(X_te_np, y_te, 256)
+
+mlp       = MLP(X_tr_np.shape[1]).to(device)
+opt_mlp   = torch.optim.AdamW(mlp.parameters(), lr=3e-4, weight_decay=0.01)
+sch_mlp   = torch.optim.lr_scheduler.CosineAnnealingLR(opt_mlp, T_max=150, eta_min=1e-5)
+best_mlp_auc = 0.0
+
+for ep in range(150):
+    mlp.train()
+    for xb, yb in mlp_tr:
+        xb, yb = xb.to(device), yb.to(device)
+        loss = F.cross_entropy(mlp(xb), yb, weight=cw_nn)
+        opt_mlp.zero_grad(set_to_none=True); loss.backward(); opt_mlp.step()
+    sch_mlp.step()
+    if (ep + 1) % 5 == 0:
+        mlp.eval()
+        p, l = [], []
+        with torch.no_grad():
+            for xb, yb in mlp_va:
+                p.append(torch.softmax(mlp(xb.to(device)), 1).cpu().numpy())
+                l.extend(yb.tolist())
+        auc = roc_auc_score(np.array(l), np.concatenate(p), multi_class="ovr", average="macro")
+        if auc > best_mlp_auc:
+            best_mlp_auc = auc; torch.save(mlp.state_dict(), "best_mlp.pth")
+
+print(f"  Best val AUROC: {best_mlp_auc:.4f}")
+mlp.load_state_dict(torch.load("best_mlp.pth")); mlp.eval()
+p_te, l_te = [], []
+with torch.no_grad():
+    for xb, yb in mlp_te:
+        p_te.append(torch.softmax(mlp(xb.to(device)), 1).cpu().numpy())
+        l_te.extend(yb.tolist())
+mlp_prob = np.concatenate(p_te); mlp_pred = mlp_prob.argmax(1)
+all_results["MLP"] = report("MLP", np.array(l_te), mlp_pred, mlp_prob)
+
+# ---------------------------------------------------------------------------
+# 4. DeepGBM  (Ke et al., KDD 2019)
+#    GBDT leaf indices are embedded per-tree and concatenated with raw features.
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 55)
+print("  4 / 4  DeepGBM")
+print("=" * 55)
+
+leaf_lgb = lgb.LGBMClassifier(
+    objective="multiclass", num_class=NUM_CLASSES, metric="multi_logloss",
+    learning_rate=0.05, num_leaves=31, n_estimators=200,
+    subsample=0.8, colsample_bytree=0.8, class_weight="balanced",
+    random_state=SEED, verbose=-1, n_jobs=-1,
+)
+leaf_lgb.fit(
+    X_tr_np, y_tr,
+    eval_set=[(X_va_np, y_va)],
+    callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(period=-1)],
+)
+booster       = leaf_lgb.booster_
+n_trees       = booster.num_trees()
+n_leaves      = leaf_lgb.num_leaves
+leaves_tr     = booster.predict(X_tr_np, pred_leaf=True).astype(np.int64)
+leaves_va     = booster.predict(X_va_np, pred_leaf=True).astype(np.int64)
+leaves_te     = booster.predict(X_te_np, pred_leaf=True).astype(np.int64)
+print(f"  GBDT: {n_trees} trees x {n_leaves} leaves")
+
+
+class DeepGBM(nn.Module):
+    """GBDT leaf embeddings concatenated with raw features, followed by MLP."""
+
+    def __init__(self, raw_dim: int, n_trees: int, n_leaves: int,
+                 emb_dim: int = 8, num_classes: int = 3):
+        super().__init__()
+        self.n_trees    = n_trees
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(n_leaves + 1, emb_dim) for _ in range(n_trees)
+        ])
+        self.mlp = nn.Sequential(
+            nn.Linear(raw_dim + n_trees * emb_dim, 256),
+            nn.BatchNorm1d(256), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(256, 256), nn.BatchNorm1d(256), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(256, 128), nn.BatchNorm1d(128), nn.GELU(), nn.Dropout(0.2),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x_raw, x_leaves):
+        embs = torch.cat([self.embeddings[t](x_leaves[:, t])
+                          for t in range(self.n_trees)], dim=1)
+        return self.mlp(torch.cat([x_raw, embs], dim=1))
+
+
+def make_dgbm_loader(X, leaves, y, bs, weighted=False):
+    ds = TensorDataset(torch.FloatTensor(X),
+                       torch.LongTensor(leaves),
+                       torch.LongTensor(y))
+    if weighted:
+        w   = [sw_tr[i] for i in range(len(y))]
+        smp = WeightedRandomSampler(w, len(w), replacement=True)
+        return DataLoader(ds, batch_size=bs, sampler=smp)
+    return DataLoader(ds, batch_size=bs, shuffle=False)
+
+
+dgbm_tr = make_dgbm_loader(X_tr_np, leaves_tr, y_tr, 128, weighted=True)
+dgbm_va = make_dgbm_loader(X_va_np, leaves_va, y_va, 256)
+dgbm_te = make_dgbm_loader(X_te_np, leaves_te, y_te, 256)
+
+dgbm          = DeepGBM(X_tr_np.shape[1], n_trees, n_leaves).to(device)
+opt_dgbm      = torch.optim.AdamW(dgbm.parameters(), lr=3e-4, weight_decay=0.01)
+sch_dgbm      = torch.optim.lr_scheduler.CosineAnnealingLR(opt_dgbm, T_max=150, eta_min=1e-5)
+best_dgbm_auc = 0.0
+
+for ep in range(150):
+    dgbm.train()
+    for xb, lb, yb in dgbm_tr:
+        xb, lb, yb = xb.to(device), lb.to(device), yb.to(device)
+        loss = F.cross_entropy(dgbm(xb, lb), yb, weight=cw_nn)
+        opt_dgbm.zero_grad(set_to_none=True); loss.backward(); opt_dgbm.step()
+    sch_dgbm.step()
+    if (ep + 1) % 5 == 0:
+        dgbm.eval()
+        p, l = [], []
+        with torch.no_grad():
+            for xb, lb, yb in dgbm_va:
+                p.append(torch.softmax(dgbm(xb.to(device), lb.to(device)), 1).cpu().numpy())
+                l.extend(yb.tolist())
+        auc = roc_auc_score(np.array(l), np.concatenate(p), multi_class="ovr", average="macro")
+        if auc > best_dgbm_auc:
+            best_dgbm_auc = auc; torch.save(dgbm.state_dict(), "best_dgbm.pth")
+
+print(f"  Best val AUROC: {best_dgbm_auc:.4f}")
+dgbm.load_state_dict(torch.load("best_dgbm.pth")); dgbm.eval()
+p_te, l_te = [], []
+with torch.no_grad():
+    for xb, lb, yb in dgbm_te:
+        p_te.append(torch.softmax(dgbm(xb.to(device), lb.to(device)), 1).cpu().numpy())
+        l_te.extend(yb.tolist())
+dgbm_prob = np.concatenate(p_te); dgbm_pred = dgbm_prob.argmax(1)
+all_results["DeepGBM"] = report("DeepGBM", np.array(l_te), dgbm_pred, dgbm_prob)
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+METRICS = ["acc", "f1_macro", "auroc", "auprc", "mcc"]
+LABELS  = ["Acc", "F1", "AUROC", "AUPRC", "MCC"]
+
+print("\n\n" + "=" * 70)
+print(f"  Tabular Baselines — {RUN_ID}")
+print("=" * 70)
+header = f"{'Model':<12}" + "".join(f"{l:>10}" for l in LABELS)
+print(f"\n{header}")
+print("-" * (12 + 10 * len(LABELS)))
+for name, res in all_results.items():
+    print(f"{name:<12}" + "".join(f"{res[m]:>10.4f}" for m in METRICS))
+
+print(f"\n  Per-class recall (test set):")
+print(f"  {'Model':<12} {'CN':>8} {'MCI':>8} {'AD':>8}")
+print("  " + "-" * 38)
+for name, res in all_results.items():
+    print(f"  {name:<12} {res['cn_recall']:>8.3f} {res['mci_recall']:>8.3f} {res['ad_recall']:>8.3f}")
+
+# ---------------------------------------------------------------------------
+# Save
+# ---------------------------------------------------------------------------
+out = {"run_id": RUN_ID, "results": all_results}
+out_path = os.path.join(OUTPUT_DIR, f"tabular_baselines_{RUN_ID}.json")
+with open(out_path, "w") as f:
+    json.dump(out, f, indent=2)
+print(f"\n  Results saved -> {out_path}")
+print("=" * 70)
