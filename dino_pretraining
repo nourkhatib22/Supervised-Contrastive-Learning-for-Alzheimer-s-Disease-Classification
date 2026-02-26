@@ -1,0 +1,454 @@
+import copy
+import datetime
+import glob
+import math
+import os
+import random
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image, ImageFilter
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from tqdm import tqdm
+from transformers import SiglipVisionModel
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+SEED = 42
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device : {device}")
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+MRI_DIR        = "data/mri_patients"           # root; one sub-folder per patient
+VISION_WEIGHTS = "checkpoints/vision_encoder.pth"
+OUTPUT_DIR     = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+RUN_ID     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+SAVE_PATH  = os.path.join(OUTPUT_DIR, f"pretrained_dino_{RUN_ID}.pth")
+
+# ---------------------------------------------------------------------------
+# Hyperparameters
+# ---------------------------------------------------------------------------
+IMG_SIZE         = 448
+N_EPOCHS         = 100
+BATCH_SIZE       = 32
+BASE_LR          = 1e-4
+MIN_LR           = 1e-6
+WEIGHT_DECAY     = 0.04
+WEIGHT_DECAY_END = 0.4
+WARMUP_EPOCHS    = 10
+PROJ_DIM         = 256         # DINO projection head output dimension
+HIDDEN_DIM       = 2048        # projection head hidden dimension
+N_LOCAL_CROPS    = 6           # number of local (small) crops per image
+LOCAL_CROP_SCALE = (0.05, 0.4) # scale range for local crops
+GLOBAL_CROP_SCALE= (0.4, 1.0)  # scale range for global crops
+TEMP_STUDENT     = 0.1         # higher temperature -> softer student dist.
+TEMP_TEACHER_BASE= 0.04        # base teacher temperature (sharpening)
+TEMP_TEACHER_END = 0.07        # teacher temperature warms up over training
+EMA_MOM_BASE     = 0.996       # EMA momentum start
+EMA_MOM_END      = 1.0         # EMA momentum end (gradually increases)
+CENTER_MOM       = 0.9         # momentum for teacher output centering
+N_UNFREEZE       = 2           # last N transformer blocks unfrozen in backbone
+SAVE_EVERY       = 10          # save checkpoint every N epochs
+IMG_MEAN         = (0.5, 0.5, 0.5)
+IMG_STD          = (0.5, 0.5, 0.5)
+
+
+# ---------------------------------------------------------------------------
+# MRI-specific augmentations
+# Spatial : random resized crop, horizontal flip, affine (shift + rotation)
+# Intensity: gaussian blur, random brightness/contrast, grayscale jitter,
+#            gaussian noise, random erasing (simulates MRI artefacts)
+# ---------------------------------------------------------------------------
+class GaussianNoise:
+    """Additive Gaussian noise — simulates MRI thermal noise."""
+    def __init__(self, std=0.02):
+        self.std = std
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        return (img + torch.randn_like(img) * self.std).clamp(-1.0, 1.0)
+
+
+class GaussianBlur:
+    """Random Gaussian blur (mimics partial-volume / PSF effects)."""
+    def __init__(self, p=0.5, radius_min=0.1, radius_max=2.0):
+        self.p, self.r_min, self.r_max = p, radius_min, radius_max
+
+    def __call__(self, img):
+        if random.random() < self.p:
+            r = random.uniform(self.r_min, self.r_max)
+            return img.filter(ImageFilter.GaussianBlur(radius=r))
+        return img
+
+
+def _base_transform(crop_scale, img_size=IMG_SIZE):
+    """Shared spatial + intensity transform with configurable crop scale."""
+    return transforms.Compose([
+        transforms.RandomResizedCrop(img_size, scale=crop_scale, ratio=(0.9, 1.1),
+                                     interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        GaussianBlur(p=0.5),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.0, hue=0.0),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMG_MEAN, std=IMG_STD),
+        GaussianNoise(std=0.02),
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.1), ratio=(0.3, 3.0), value=0),
+    ])
+
+
+GLOBAL_TRANSFORM_1 = _base_transform(GLOBAL_CROP_SCALE)
+GLOBAL_TRANSFORM_2 = _base_transform(GLOBAL_CROP_SCALE)
+LOCAL_TRANSFORM    = _base_transform(LOCAL_CROP_SCALE, img_size=IMG_SIZE // 2)
+
+
+# ---------------------------------------------------------------------------
+# Dataset — one slice per sample; two global + N local crops per __getitem__
+# ---------------------------------------------------------------------------
+class MRISliceDataset(Dataset):
+    """
+    Loads all PNG slices from all patient folders.
+    Returns (global_crop_1, global_crop_2, [local_crop_1, ..., local_crop_N]).
+    """
+    def __init__(self, root: str):
+        self.paths = sorted(glob.glob(os.path.join(root, "*", "*.png")))
+        if not self.paths:
+            raise FileNotFoundError(f"No PNG slices found under {root}")
+        print(f"  Dataset: {len(self.paths):,} slices from {root}")
+
+    def __len__(self): return len(self.paths)
+
+    def __getitem__(self, i):
+        img = Image.open(self.paths[i]).convert("RGB")
+        g1  = GLOBAL_TRANSFORM_1(img)
+        g2  = GLOBAL_TRANSFORM_2(img)
+        lcs = [LOCAL_TRANSFORM(img) for _ in range(N_LOCAL_CROPS)]
+        return g1, g2, lcs
+
+
+def _collate(batch):
+    g1  = torch.stack([b[0] for b in batch])
+    g2  = torch.stack([b[1] for b in batch])
+    lcs = [torch.stack([b[2][k] for b in batch]) for k in range(N_LOCAL_CROPS)]
+    return g1, g2, lcs
+
+
+# ---------------------------------------------------------------------------
+# DINO projection head
+# ---------------------------------------------------------------------------
+class DINOHead(nn.Module):
+    """
+    3-layer MLP projection head followed by an L2-normalised linear layer.
+    Matches the original DINO head design.
+    """
+    def __init__(self, in_dim: int, hidden_dim: int = HIDDEN_DIM,
+                 out_dim: int = PROJ_DIM, n_layers: int = 3):
+        super().__init__()
+        layers = []
+        dims   = [in_dim] + [hidden_dim] * (n_layers - 1) + [hidden_dim]
+        for d_in, d_out in zip(dims[:-1], dims[1:]):
+            layers += [nn.Linear(d_in, d_out), nn.GELU()]
+        self.mlp  = nn.Sequential(*layers)
+        self.last  = nn.utils.weight_norm(nn.Linear(hidden_dim, out_dim, bias=False))
+        self.last.weight_g.data.fill_(1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.mlp(x)
+        x = F.normalize(x, dim=-1, p=2)
+        return self.last(x)
+
+
+# ---------------------------------------------------------------------------
+# Full DINO model (backbone + head)
+# ---------------------------------------------------------------------------
+class DINOModel(nn.Module):
+    def __init__(self, backbone: nn.Module, in_dim: int):
+        super().__init__()
+        self.backbone = backbone
+        self.head     = DINOHead(in_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.backbone(x).pooler_output   # (B, in_dim)
+        return self.head(feat)
+
+
+# ---------------------------------------------------------------------------
+# DINO loss — KL(teacher || student) averaged over all view pairs
+# ---------------------------------------------------------------------------
+class DINOLoss(nn.Module):
+    """
+    Centred cross-entropy between teacher (sharpened) and student (softened)
+    output distributions, equivalent to KL(p_t || p_s) up to a constant.
+
+    Teacher outputs are centred (running mean subtracted) to prevent collapse.
+    """
+    def __init__(self, out_dim: int = PROJ_DIM,
+                 temp_s: float = TEMP_STUDENT,
+                 temp_t_base: float = TEMP_TEACHER_BASE,
+                 temp_t_end: float  = TEMP_TEACHER_END,
+                 n_epochs: int      = N_EPOCHS,
+                 warmup_t_epochs: int = WARMUP_EPOCHS,
+                 center_mom: float  = CENTER_MOM):
+        super().__init__()
+        self.temp_s        = temp_s
+        self.center_mom    = center_mom
+        self.register_buffer("center", torch.zeros(1, out_dim))
+
+        # Teacher temperature schedule: warm up from temp_t_base to temp_t_end
+        warmup = np.linspace(temp_t_base, temp_t_end, warmup_t_epochs)
+        rest   = np.full(n_epochs - warmup_t_epochs, temp_t_end)
+        self.temp_t_schedule = np.concatenate([warmup, rest])
+
+    def forward(self, student_out: list, teacher_out: list, epoch: int) -> torch.Tensor:
+        """
+        Args:
+            student_out : list of (B, D) student logits for each view
+            teacher_out : list of (B, D) teacher logits for global views only
+            epoch       : current epoch index (0-based)
+        """
+        temp_t = self.temp_t_schedule[epoch]
+
+        # Sharpen teacher: subtract centre, divide by low temperature, softmax
+        t_probs = [
+            F.softmax((t - self.center) / temp_t, dim=-1).detach()
+            for t in teacher_out
+        ]
+        # Student: divide by higher temperature, log-softmax
+        s_log_probs = [
+            F.log_softmax(s / self.temp_s, dim=-1)
+            for s in student_out
+        ]
+
+        total, n_pairs = 0.0, 0
+        for t_p in t_probs:
+            for i, s_lp in enumerate(s_log_probs):
+                if i < len(teacher_out):
+                    # skip same-view pairs (student global i vs teacher global i)
+                    if s_lp is s_log_probs[i] and t_p is t_probs[i]:
+                        continue
+                # KL(p_t || p_s) = sum p_t * (log p_t - log p_s)
+                # = -sum p_t * log p_s + const  (cross-entropy form)
+                total   += -(t_p * s_lp).sum(dim=-1).mean()
+                n_pairs += 1
+
+        loss = total / max(n_pairs, 1)
+
+        # Update centre with exponential moving average of teacher outputs
+        with torch.no_grad():
+            batch_center = torch.cat(teacher_out).mean(dim=0, keepdim=True)
+            self.center  = self.center_mom * self.center + (1 - self.center_mom) * batch_center
+
+        return loss
+
+
+# ---------------------------------------------------------------------------
+# Schedule helpers
+# ---------------------------------------------------------------------------
+def _cosine_schedule(base_val: float, end_val: float,
+                     n_epochs: int, warmup: int = 0) -> np.ndarray:
+    if warmup:
+        w = np.linspace(0.0, base_val, warmup)
+    else:
+        w = np.array([])
+    rest = np.array([
+        end_val + 0.5 * (base_val - end_val) *
+        (1 + math.cos(math.pi * i / (n_epochs - warmup)))
+        for i in range(n_epochs - warmup)
+    ])
+    return np.concatenate([w, rest])
+
+
+lr_schedule  = _cosine_schedule(BASE_LR, MIN_LR, N_EPOCHS, warmup=WARMUP_EPOCHS)
+wd_schedule  = _cosine_schedule(WEIGHT_DECAY, WEIGHT_DECAY_END, N_EPOCHS)
+ema_schedule = _cosine_schedule(EMA_MOM_BASE, EMA_MOM_END, N_EPOCHS)
+
+
+# ---------------------------------------------------------------------------
+# Build student and teacher
+# ---------------------------------------------------------------------------
+print("\nLoading MedSigLIP backbone ...")
+backbone_s = SiglipVisionModel.from_pretrained("google/medsiglip-448")
+ck = torch.load(VISION_WEIGHTS, map_location="cpu")
+backbone_s.load_state_dict(ck["student_backbone"], strict=False)
+del ck
+
+# Freeze early layers; unfreeze last N_UNFREEZE transformer blocks
+for p in backbone_s.parameters():
+    p.requires_grad = False
+enc_layers    = backbone_s.vision_model.encoder.layers
+unfreeze_from = len(enc_layers) - N_UNFREEZE
+for i, blk in enumerate(enc_layers):
+    if i >= unfreeze_from:
+        for p in blk.parameters():
+            p.requires_grad = True
+for p in backbone_s.vision_model.post_layernorm.parameters():
+    p.requires_grad = True
+
+BACKBONE_DIM = backbone_s.config.hidden_size   # 1152 for MedSigLIP-448
+
+student = DINOModel(backbone_s, BACKBONE_DIM).to(device)
+teacher = copy.deepcopy(student).to(device)
+
+# Teacher never receives gradients — updated via EMA only
+for p in teacher.parameters():
+    p.requires_grad = False
+
+n_student = sum(p.numel() for p in student.parameters() if p.requires_grad)
+print(f"  Backbone dim : {BACKBONE_DIM}")
+print(f"  Student trainable params : {n_student:,}")
+
+# ---------------------------------------------------------------------------
+# Dataset and loader
+# ---------------------------------------------------------------------------
+dataset = MRISliceDataset(MRI_DIR)
+loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                     collate_fn=_collate, num_workers=4,
+                     pin_memory=True, drop_last=True)
+
+# ---------------------------------------------------------------------------
+# Optimiser and loss
+# ---------------------------------------------------------------------------
+# Separate parameter groups: backbone (unfrozen) vs head
+backbone_params = [p for p in student.backbone.parameters() if p.requires_grad]
+head_params     = list(student.head.parameters())
+
+optimizer = torch.optim.AdamW([
+    {"params": backbone_params, "lr": BASE_LR * 0.1},  # lower LR for fine-tuning
+    {"params": head_params,     "lr": BASE_LR},
+], weight_decay=WEIGHT_DECAY)
+
+dino_loss = DINOLoss(
+    out_dim         = PROJ_DIM,
+    temp_s          = TEMP_STUDENT,
+    temp_t_base     = TEMP_TEACHER_BASE,
+    temp_t_end      = TEMP_TEACHER_END,
+    n_epochs        = N_EPOCHS,
+    warmup_t_epochs = WARMUP_EPOCHS,
+    center_mom      = CENTER_MOM,
+).to(device)
+
+scaler = torch.amp.GradScaler("cuda")
+
+print(f"\nStarting DINO pretraining for {N_EPOCHS} epochs ...")
+print(f"  Batch size : {BATCH_SIZE} | Steps/epoch : {len(loader)}")
+print(f"  Global crops : 2 | Local crops : {N_LOCAL_CROPS}")
+print(f"  Saving every {SAVE_EVERY} epochs -> {SAVE_PATH}\n")
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+for epoch in range(N_EPOCHS):
+
+    # Apply per-epoch schedules
+    lr_val  = lr_schedule[epoch]
+    wd_val  = wd_schedule[epoch]
+    ema_val = ema_schedule[epoch]
+
+    for g in optimizer.param_groups:
+        g["weight_decay"] = wd_val
+    # backbone group gets scaled-down LR
+    optimizer.param_groups[0]["lr"] = lr_val * 0.1
+    optimizer.param_groups[1]["lr"] = lr_val
+
+    student.train()
+    teacher.eval()
+
+    epoch_loss = 0.0
+
+    for step, (g1, g2, lcs) in enumerate(tqdm(loader, desc=f"Ep {epoch+1:>3}/{N_EPOCHS}",
+                                               leave=False, ncols=80)):
+        g1  = g1.to(device, non_blocking=True)
+        g2  = g2.to(device, non_blocking=True)
+        lcs = [lc.to(device, non_blocking=True) for lc in lcs]
+
+        all_views    = [g1, g2] + lcs
+        global_views = [g1, g2]
+
+        with torch.amp.autocast("cuda"):
+            # Student processes all views (global + local)
+            student_out = [student(v) for v in all_views]
+
+            # Teacher processes global views only (no local crops for teacher)
+            with torch.no_grad():
+                teacher_out = [teacher(v) for v in global_views]
+
+            loss = dino_loss(student_out, teacher_out, epoch)
+
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+
+        # Gradient clipping — critical for vision transformer stability
+        torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=3.0)
+
+        scaler.step(optimizer); scaler.update()
+
+        # EMA teacher update: theta_t <- m * theta_t + (1 - m) * theta_s
+        with torch.no_grad():
+            for ps, pt in zip(student.parameters(), teacher.parameters()):
+                pt.data.mul_(ema_val).add_((1.0 - ema_val) * ps.data)
+
+        epoch_loss += loss.item()
+
+    avg_loss = epoch_loss / len(loader)
+    print(f"  Ep {epoch+1:>3}/{N_EPOCHS} | loss {avg_loss:.5f} | "
+          f"lr {lr_val:.2e} | wd {wd_val:.4f} | ema {ema_val:.5f} | "
+          f"temp_t {dino_loss.temp_t_schedule[epoch]:.4f}")
+
+    # Periodic checkpoint
+    if (epoch + 1) % SAVE_EVERY == 0:
+        ckpt = {
+            "epoch":            epoch + 1,
+            "student_backbone": student.backbone.state_dict(),
+            "student_head":     student.head.state_dict(),
+            "teacher_backbone": teacher.backbone.state_dict(),
+            "teacher_head":     teacher.head.state_dict(),
+            "optimizer":        optimizer.state_dict(),
+            "loss":             avg_loss,
+            "cfg": dict(
+                img_size=IMG_SIZE, proj_dim=PROJ_DIM, n_local_crops=N_LOCAL_CROPS,
+                temp_s=TEMP_STUDENT, temp_t_base=TEMP_TEACHER_BASE,
+                n_epochs=N_EPOCHS, batch_size=BATCH_SIZE, base_lr=BASE_LR,
+                n_unfreeze=N_UNFREEZE,
+            ),
+        }
+        mid_path = os.path.join(OUTPUT_DIR, f"pretrained_dino_{RUN_ID}_ep{epoch+1}.pth")
+        torch.save(ckpt, mid_path)
+        print(f"  -> Checkpoint saved: {mid_path}")
+
+# ---------------------------------------------------------------------------
+# Final checkpoint  (named "pretrained" for downstream use)
+# ---------------------------------------------------------------------------
+final_ckpt = {
+    "epoch":            N_EPOCHS,
+    "student_backbone": student.backbone.state_dict(),
+    "student_head":     student.head.state_dict(),
+    "teacher_backbone": teacher.backbone.state_dict(),
+    "teacher_head":     teacher.head.state_dict(),
+    "loss":             avg_loss,
+    "cfg": dict(
+        img_size=IMG_SIZE, proj_dim=PROJ_DIM, n_local_crops=N_LOCAL_CROPS,
+        temp_s=TEMP_STUDENT, temp_t_base=TEMP_TEACHER_BASE,
+        n_epochs=N_EPOCHS, batch_size=BATCH_SIZE, base_lr=BASE_LR,
+        n_unfreeze=N_UNFREEZE,
+    ),
+}
+torch.save(final_ckpt, SAVE_PATH)
+print(f"\nPretraining complete.")
+print(f"  Final checkpoint -> {SAVE_PATH}")
+print(f"\nTo use in the fusion pipeline, set:")
+print(f"  VISION_WEIGHTS = \"{SAVE_PATH}\"")
+print(f"  Then in multimodal_fusion_pipeline.py change the load line to:")
+print(f"  vision.load_state_dict(ck[\"student_backbone\"], strict=False)")
