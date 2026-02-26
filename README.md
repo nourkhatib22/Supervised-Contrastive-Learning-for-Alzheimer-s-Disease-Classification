@@ -1,6 +1,5 @@
 # Supervised Contrastive Multimodal Learning for Clinically Feasible Alzheimer's Disease Classification
 
-> Official implementation — MICCAI 2025 (anonymized submission)
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)](https://pytorch.org/)
@@ -25,7 +24,6 @@ Experiments on **ADNI** (n = 1,044) demonstrate performance comparable to SOTA m
 
 ## Architecture
 
-![Architecture](assets/architecture.png)
 
 **MRI branch** — 2D axial slices (skull-stripped, 448×448, normalised to [−1, 1]). Central slices targeting medial temporal lobe, hippocampal structures, and ventricular areas are selected automatically. Slice embeddings are mean-pooled per patient.
 
