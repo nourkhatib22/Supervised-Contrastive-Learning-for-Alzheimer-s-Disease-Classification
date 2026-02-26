@@ -131,72 +131,6 @@ checkpoints/
 └── vision_encoder.pth      # MedSigLIP weights (key: "student_backbone")
 ```
 
----
-
-## Usage
-
-### Step 1 — DINO Self-Supervised Pretraining
-
-Adapt the MedSigLIP encoder to the target MRI distribution before supervised training.
-
-```bash
-python dino_pretraining/dino_pretrain.py
-```
-
-Key hyperparameters (top of file):
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `N_EPOCHS` | 100 | Total pretraining epochs |
-| `BATCH_SIZE` | 32 | Slices per batch |
-| `N_UNFREEZE` | 2 | Last N transformer blocks unfrozen |
-| `N_LOCAL_CROPS` | 6 | Local crops per image |
-| `TEMP_STUDENT` | 0.1 | Student softmax temperature |
-| `TEMP_TEACHER_BASE` | 0.04 | Teacher temperature (start) |
-| `EMA_MOM_BASE` | 0.996 | EMA momentum (start) |
-
-Output: `outputs/pretrained_dino_<RUN_ID>.pth` — set this as `VISION_WEIGHTS` in Step 2.
-
-### Step 2 — Multimodal Fusion Training
-
-Runs SupCon tabular pretraining (Stage 1), then end-to-end fusion training with the DINO-pretrained vision encoder (Stage 2).
-
-```bash
-# Update VISION_WEIGHTS in the script to point to your DINO checkpoint
-python multimodal/multimodal_fusion_pipeline.py
-```
-
-Key hyperparameters:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `SUPCON_EP` | 100 | SupCon tabular pretraining epochs |
-| `SUPCON_LR` | 3e-4 | SupCon learning rate |
-| `SUPCON_WEIGHT` (λ) | 0.2 | Weight on contrastive vs CE loss |
-| `MCI_WEIGHT_BOOST` | 1.8 | Class re-weighting for MCI |
-| `FUS_EP` | 30 | Fusion training epochs |
-| `FUS_LR` | 5e-4 | Fusion learning rate |
-| `VISION_LR_SCALE` | 0.05 | LR scale for vision unfrozen blocks |
-| `N_UNFREEZE_BLOCKS` | 2 | Vision transformer blocks to fine-tune |
-
-Outputs saved to `outputs/`:
-- `supcon_tab_<RUN_ID>.pth` — trained tabular SupCon model
-- `fusion_<RUN_ID>.pth` — full fusion model
-- `config_<RUN_ID>.json` — run config + test metrics
-- `tsne_fusion_<RUN_ID>.png` — t-SNE visualisation of fusion embeddings
-
-### Step 3 — Tabular Baselines
-
-Evaluate LightGBM, XGBoost, MLP, and DeepGBM on the same patient splits.
-
-```bash
-python tabular_baselines/tabular_baselines.py
-```
-
-Reports Accuracy, F1 (macro), AUROC, AUPRC, and MCC for all four models.
-
----
-
 ## Method Details
 
 ### DINO Pretraining
@@ -219,22 +153,6 @@ An ordinal penalty is applied: CN–AD pairs are pushed apart more strongly than
 
 MRI embeddings (512-d) and tabular embeddings (256-d) are concatenated into a 768-d joint representation, which is passed through a 3-layer MLP classifier. The vision encoder's last 2 transformer blocks receive gradients during fusion training (at 5% of the fusion learning rate), enabling end-to-end adaptation while preserving pretrained structural representations.
 
----
-
-## Citation
-
-If you find this work useful, please cite:
-
-```bibtex
-@inproceedings{anonymized2025supcon_ad,
-  title     = {Supervised Contrastive Multimodal Learning for Clinically Feasible Alzheimer's Disease Classification},
-  booktitle = {Medical Image Computing and Computer-Assisted Intervention (MICCAI)},
-  year      = {2025},
-  note      = {Anonymized for review}
-}
-```
-
----
 
 ## Acknowledgements
 
@@ -244,7 +162,6 @@ This work builds on:
 - [DINO](https://github.com/facebookresearch/dino) — Caron et al., ICCV 2021
 - [MedSigLIP / MedGemma](https://arxiv.org/abs/2507.05201) — Sellergren et al., 2025
 - [SupCon](https://github.com/HobbitLong/SupContrast) — Khosla et al., NeurIPS 2020
-- [DeepGBM](https://dl.acm.org/doi/10.1145/3292500.3330858) — Ke et al., KDD 2019
 
 ---
 
