@@ -1,0 +1,777 @@
+import datetime
+import gc
+import glob
+import json
+import math
+import os
+import random
+from collections import defaultdict
+
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+from sklearn.manifold import TSNE
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from torch.utils.data import DataLoader, Dataset, TensorDataset, WeightedRandomSampler
+from torchvision import transforms
+from transformers import SiglipVisionModel
+from tqdm import tqdm
+
+matplotlib.use("Agg")
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device: {device}")
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+MRI_DIR        = "data/mri_patients"
+MRI_LABELS     = "data/mri_labels.csv"
+VISION_WEIGHTS = "checkpoints/vision_encoder.pth"
+SPLITS_JSON    = "data/splits.json"
+TRAIN_CSV      = "data/tabular/train.csv"
+VAL_CSV        = "data/tabular/val.csv"
+TEST_CSV       = "data/tabular/test.csv"
+OUTPUT_DIR     = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+RUN_ID            = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+NUM_CLASSES       = 3
+CLASS_NAMES       = ["CN", "MCI", "AD"]
+VISION_POOLER_DIM = 1152
+MRI_PROJ_DIM      = 512
+TAB_PROJ_DIM      = 256
+N_UNFREEZE_BLOCKS = 2
+IMG_MEAN          = [0.5, 0.5, 0.5]
+IMG_STD           = [0.5, 0.5, 0.5]
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+CFG = dict(
+    run_id            = RUN_ID,
+    seed              = SEED,
+    supcon_tau        = 0.07,
+    supcon_weight     = 0.2,
+    supcon_ep         = 100,
+    supcon_bs         = 64,
+    supcon_lr         = 3e-4,
+    encoder_dim       = 256,
+    proj_dim          = 128,
+    mci_weight_boost  = 1.8,
+    fus_ep            = 30,
+    fus_pat           = 8,
+    fus_bs            = 32,
+    fus_lr            = 5e-4,
+    vision_lr_scale   = 0.05,
+    label_smooth      = 0.1,
+    focal_gamma       = 1.0,
+    n_unfreeze_blocks = N_UNFREEZE_BLOCKS,
+    push_CN_MCI       = 1.0,
+    push_CN_AD        = 2.5,
+    push_MCI_CN       = 1.8,
+    push_MCI_AD       = 0.8,
+    push_AD_CN        = 2.5,
+    push_AD_MCI       = 0.8,
+)
+
+SUPCON_TAU       = CFG["supcon_tau"]
+SUPCON_WEIGHT    = CFG["supcon_weight"]
+SUPCON_EP        = CFG["supcon_ep"]
+SUPCON_BS        = CFG["supcon_bs"]
+SUPCON_LR        = CFG["supcon_lr"]
+ENCODER_DIM      = CFG["encoder_dim"]
+PROJ_DIM         = CFG["proj_dim"]
+MCI_WEIGHT_BOOST = CFG["mci_weight_boost"]
+FUS_EP           = CFG["fus_ep"]
+FUS_PAT          = CFG["fus_pat"]
+FUS_BS           = CFG["fus_bs"]
+VISION_LR_SCALE  = CFG["vision_lr_scale"]
+
+print(f"Run: {RUN_ID}\n")
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+with open(SPLITS_JSON) as f:
+    _splits = json.load(f)
+SPLIT_TRAIN_PIDS = [str(p) for p in _splits["train"]]
+SPLIT_VAL_PIDS   = [str(p) for p in _splits["val"]]
+SPLIT_TEST_PIDS  = [str(p) for p in _splits["test"]]
+
+
+def _remap_diagnosis(df: pd.DataFrame) -> pd.DataFrame:
+    if set(df["DIAGNOSIS"].dropna().unique()) <= {1, 2, 3}:
+        df["DIAGNOSIS"] = df["DIAGNOSIS"].map({1: 0, 2: 1, 3: 2})
+    df = df.dropna(subset=["DIAGNOSIS"]).copy()
+    df["DIAGNOSIS"] = df["DIAGNOSIS"].astype(int)
+    return df[df["DIAGNOSIS"].isin([0, 1, 2])].copy()
+
+
+def load_split_csv(path: str, name: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["subject_id"] = df["subject_id"].astype(str)
+    df = _remap_diagnosis(df)
+    df = df.drop_duplicates(subset="subject_id").set_index("subject_id")
+    counts = np.bincount(df["DIAGNOSIS"].values, minlength=3)
+    print(f"  {name}: {len(df)} subjects  {counts}")
+    return df
+
+
+mri_df = _remap_diagnosis(pd.read_csv(MRI_LABELS).assign(
+    subject_id=lambda d: d["subject_id"].astype(str)
+))
+pid_lab_mri = dict(zip(mri_df["subject_id"], mri_df["DIAGNOSIS"]))
+
+train_df = load_split_csv(TRAIN_CSV, "train")
+val_df   = load_split_csv(VAL_CSV,   "val")
+test_df  = load_split_csv(TEST_CSV,  "test")
+
+train_pids = list(train_df.index)
+val_pids   = list(val_df.index)
+test_pids  = list(test_df.index)
+
+# ---------------------------------------------------------------------------
+# Tabular preprocessing
+# ---------------------------------------------------------------------------
+y_train = train_df["DIAGNOSIS"].values.astype(int)
+y_val   = val_df["DIAGNOSIS"].values.astype(int)
+y_test  = test_df["DIAGNOSIS"].values.astype(int)
+
+X_tr = train_df.drop(columns=["DIAGNOSIS"]).copy()
+X_va = val_df.drop(columns=["DIAGNOSIS"]).copy()
+X_te = test_df.drop(columns=["DIAGNOSIS"]).copy()
+
+
+def _safe_le_transform(le: LabelEncoder, s: pd.Series) -> np.ndarray:
+    known, fb = set(le.classes_), le.classes_[0]
+    return np.array([le.transform([v])[0] if v in known
+                     else le.transform([fb])[0] for v in s.astype(str)])
+
+
+for col in X_tr.columns:
+    if X_tr[col].dtype == "object":
+        le = LabelEncoder().fit(X_tr[col].astype(str))
+        X_tr[col] = le.transform(X_tr[col].astype(str))
+        X_va[col] = _safe_le_transform(le, X_va[col])
+        X_te[col] = _safe_le_transform(le, X_te[col])
+
+scaler     = StandardScaler()
+X_train_np = scaler.fit_transform(X_tr.values.astype(np.float32))
+X_val_np   = scaler.transform(X_va.values.astype(np.float32))
+X_test_np  = scaler.transform(X_te.values.astype(np.float32))
+
+tab_in_dim        = X_train_np.shape[1]
+CFG["tab_in_dim"] = tab_in_dim
+
+cc_train = np.bincount(y_train, minlength=NUM_CLASSES).astype(np.float32)
+cw       = 1.0 / np.maximum(cc_train, 1)
+cw[1]   *= MCI_WEIGHT_BOOST
+cw       = cw / cw.sum() * NUM_CLASSES
+cw_t     = torch.tensor(cw, dtype=torch.float32).to(device)
+print(f"\n  Tabular dim: {tab_in_dim} | CW: {cw[0]:.3f}/{cw[1]:.3f}/{cw[2]:.3f}")
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+def compute_metrics(labels, preds, probs, tag):
+    m = dict(
+        accuracy  = accuracy_score(labels, preds),
+        f1_macro  = f1_score(labels, preds, average="macro",    zero_division=0),
+        f1_weight = f1_score(labels, preds, average="weighted", zero_division=0),
+        prec_mac  = precision_score(labels, preds, average="macro",    zero_division=0),
+        rec_mac   = recall_score(labels,    preds, average="macro",    zero_division=0),
+        mcc       = matthews_corrcoef(labels, preds),
+        auroc_ovr = roc_auc_score(labels, probs, multi_class="ovr", average="macro"),
+    )
+    print(f"\n[{tag}]")
+    for k, v in m.items():
+        print(f"  {k:>14s}: {v:.4f}")
+    print(f"\n  Confusion matrix:\n{confusion_matrix(labels, preds)}")
+    for c, cn in enumerate(CLASS_NAMES):
+        mask = labels == c
+        if mask.sum():
+            print(f"  {cn} recall: {(preds[mask]==c).mean():.3f} ({(preds[mask]==c).sum()}/{mask.sum()})")
+    if "test" in tag.lower():
+        print(f"\n{classification_report(labels, preds, target_names=CLASS_NAMES)}")
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 — OrdinalSupCon tabular pre-training
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Stage 1 — OrdinalSupCon Tabular Pre-training")
+print("=" * 60)
+
+
+class OrdinalSupConLoss(nn.Module):
+    """SupCon loss with ordinal penalty weights between non-adjacent classes."""
+
+    def __init__(self, tau: float = 0.07):
+        super().__init__()
+        self.tau = tau
+        self.push_w = torch.tensor([
+            [0.0,              CFG["push_CN_MCI"],  CFG["push_CN_AD"]],
+            [CFG["push_MCI_CN"], 0.0,               CFG["push_MCI_AD"]],
+            [CFG["push_AD_CN"],  CFG["push_AD_MCI"], 0.0],
+        ], dtype=torch.float32)
+
+    def forward(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        B   = z.shape[0]
+        z   = F.normalize(z, dim=1)
+        pw  = self.push_w.to(z.device)
+        sim = torch.matmul(z, z.T) / self.tau
+        sim = sim - sim.max(dim=1, keepdim=True).values.detach()
+        exp = torch.exp(sim)
+        eye = torch.eye(B, dtype=torch.bool, device=z.device)
+
+        loss, n = torch.tensor(0.0, device=z.device), 0
+        for i in range(B):
+            pos = (y == y[i]) & ~eye[i]
+            if not pos.any():
+                continue
+            denom = sum(
+                (1.0 if y[j] == y[i] else pw[y[i], y[j]]) * exp[i, j]
+                for j in range(B) if not eye[i, j]
+            )
+            loss += -(sim[i][pos] - torch.log(denom + 1e-8)).mean()
+            n    += 1
+        return loss / max(n, 1)
+
+
+class TabularEncoder(nn.Module):
+    def __init__(self, in_dim: int, hidden: int = 256, out_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.BatchNorm1d(hidden), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(hidden, out_dim), nn.BatchNorm1d(out_dim), nn.GELU(), nn.Dropout(0.2),
+        )
+
+    def forward(self, x): return self.net(x)
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, in_dim), nn.ReLU(),
+            nn.Linear(in_dim, out_dim),
+        )
+
+    def forward(self, x): return self.net(x)
+
+
+class SupConTabModel(nn.Module):
+    def __init__(self, in_dim, enc_dim, proj_dim, num_classes):
+        super().__init__()
+        self.encoder    = TabularEncoder(in_dim, enc_dim, enc_dim)
+        self.projector  = ProjectionHead(enc_dim, proj_dim)
+        self.classifier = nn.Linear(enc_dim, num_classes)
+
+    def forward(self, x):
+        e = self.encoder(x)
+        return e, self.projector(e), self.classifier(e)
+
+    def encode(self, x):  return self.encoder(x)
+    def predict(self, x): return self.classifier(self.encoder(x))
+
+
+X_tr_t = torch.FloatTensor(X_train_np).to(device)
+X_va_t = torch.FloatTensor(X_val_np).to(device)
+X_te_t = torch.FloatTensor(X_test_np).to(device)
+
+sc_tr_dl = DataLoader(
+    TensorDataset(X_tr_t, torch.LongTensor(y_train).to(device)),
+    batch_size=SUPCON_BS,
+    sampler=WeightedRandomSampler(
+        [1.0 / max(cc_train[l], 1) for l in y_train], len(y_train), replacement=True
+    ),
+)
+sc_va_dl = DataLoader(TensorDataset(X_va_t, torch.LongTensor(y_val).to(device)),   batch_size=256, shuffle=False)
+sc_te_dl = DataLoader(TensorDataset(X_te_t, torch.LongTensor(y_test).to(device)),  batch_size=256, shuffle=False)
+
+sc_model      = SupConTabModel(tab_in_dim, ENCODER_DIM, PROJ_DIM, NUM_CLASSES).to(device)
+sc_loss_fn    = OrdinalSupConLoss(tau=SUPCON_TAU)
+opt_sc        = torch.optim.AdamW(sc_model.parameters(), lr=SUPCON_LR, weight_decay=0.01)
+sch_sc        = torch.optim.lr_scheduler.CosineAnnealingLR(opt_sc, T_max=SUPCON_EP, eta_min=1e-5)
+scaler_sc     = torch.amp.GradScaler("cuda")
+best_sc_score = 0.0
+
+for ep in range(SUPCON_EP):
+    sc_model.train()
+    r_ce = r_sc = nb = 0
+    for X, y in sc_tr_dl:
+        with torch.amp.autocast("cuda"):
+            enc, proj, logits = sc_model(X)
+            l_ce = F.cross_entropy(logits, y, weight=cw_t)
+            l_sc = sc_loss_fn(proj, y)
+            loss = (1 - SUPCON_WEIGHT) * l_ce + SUPCON_WEIGHT * l_sc
+        opt_sc.zero_grad(set_to_none=True)
+        scaler_sc.scale(loss).backward()
+        scaler_sc.unscale_(opt_sc)
+        torch.nn.utils.clip_grad_norm_(sc_model.parameters(), 1.0)
+        scaler_sc.step(opt_sc); scaler_sc.update()
+        r_ce += l_ce.item(); r_sc += l_sc.item(); nb += 1
+    sch_sc.step()
+
+    if (ep + 1) % 10 == 0:
+        sc_model.eval()
+        p_all, l_all = [], []
+        with torch.no_grad():
+            for X, y in sc_va_dl:
+                p_all.append(torch.softmax(sc_model.predict(X), 1).cpu())
+                l_all.append(y.cpu())
+        fp = torch.cat(p_all).numpy(); fl = torch.cat(l_all).numpy().astype(int)
+        preds = fp.argmax(1)
+        auc   = roc_auc_score(fl, fp, multi_class="ovr", average="macro")
+        mci_r = (preds[fl==1]==1).mean() if (fl==1).sum() else 0.0
+        score = auc * (0.5 + 0.5 * mci_r)
+        print(f"  Ep {ep+1:>3} | CE {r_ce/nb:.4f}  SC {r_sc/nb:.4f} | "
+              f"AUROC {auc:.4f}  MCI-rec {mci_r:.3f}")
+        if score > best_sc_score:
+            best_sc_score = score
+            torch.save(sc_model.state_dict(), "best_supcon_tab.pth")
+            print(f"         -> saved (score={score:.4f})")
+
+sc_model.load_state_dict(torch.load("best_supcon_tab.pth"))
+sc_save = os.path.join(OUTPUT_DIR, f"supcon_tab_{RUN_ID}.pth")
+torch.save({"state_dict": sc_model.state_dict(), "cfg": CFG}, sc_save)
+
+# ---------------------------------------------------------------------------
+# Stage 1 evaluation
+# ---------------------------------------------------------------------------
+sc_model.eval()
+for tag, dl in [("val", sc_va_dl), ("test", sc_te_dl)]:
+    p_all, l_all = [], []
+    with torch.no_grad():
+        for X, y in dl:
+            p_all.append(torch.softmax(sc_model.predict(X), 1).cpu())
+            l_all.append(y.cpu())
+    fp = torch.cat(p_all).numpy(); fl = torch.cat(l_all).numpy().astype(int)
+    compute_metrics(fl, fp.argmax(1), fp, f"SupCon-Tab {tag}")
+
+with torch.no_grad():
+    sc_te_fp = torch.softmax(sc_model.predict(X_te_t), 1).cpu().numpy()
+    sc_va_fp = torch.softmax(sc_model.predict(X_va_t), 1).cpu().numpy()
+sc_te_fl  = y_test.astype(int)
+sc_te_pr  = sc_te_fp.argmax(1)
+sc_te_acc = accuracy_score(sc_te_fl, sc_te_pr)
+sc_te_auc = roc_auc_score(sc_te_fl, sc_te_fp, multi_class="ovr", average="macro")
+sc_te_mci = (sc_te_pr[sc_te_fl==1]==1).mean() if (sc_te_fl==1).sum() else 0.0
+sc_va_acc = accuracy_score(y_val, sc_va_fp.argmax(1))
+
+for p in sc_model.parameters():
+    p.requires_grad = False
+sc_model.eval()
+
+with torch.no_grad():
+    train_tab_emb = sc_model.encode(X_tr_t).cpu()
+    val_tab_emb   = sc_model.encode(X_va_t).cpu()
+    test_tab_emb  = sc_model.encode(X_te_t).cpu()
+
+CFG["tab_fus_dim"] = train_tab_emb.shape[1]
+all_pid2tabemb = {
+    **{pid: train_tab_emb[i] for i, pid in enumerate(train_pids)},
+    **{pid: val_tab_emb[i]   for i, pid in enumerate(val_pids)},
+    **{pid: test_tab_emb[i]  for i, pid in enumerate(test_pids)},
+}
+
+# ---------------------------------------------------------------------------
+# Stage 2 — Vision encoder (partial unfreeze)
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Stage 2 — Vision Encoder Setup")
+print("=" * 60)
+
+tf_mri = transforms.Compose([
+    transforms.Resize((448, 448)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMG_MEAN, std=IMG_STD),
+])
+
+vision = SiglipVisionModel.from_pretrained("google/medsiglip-448")
+ck = torch.load(VISION_WEIGHTS, map_location="cpu")
+vision.load_state_dict(ck["student_backbone"], strict=False)
+del ck; gc.collect()
+
+for p in vision.parameters():
+    p.requires_grad = False
+
+enc_layers    = vision.vision_model.encoder.layers
+unfreeze_from = len(enc_layers) - N_UNFREEZE_BLOCKS
+for i, blk in enumerate(enc_layers):
+    if i >= unfreeze_from:
+        for p in blk.parameters():
+            p.requires_grad = True
+for p in vision.vision_model.post_layernorm.parameters():
+    p.requires_grad = True
+
+n_frozen    = sum(p.numel() for p in vision.parameters() if not p.requires_grad)
+n_trainable = sum(p.numel() for p in vision.parameters() if p.requires_grad)
+print(f"  Frozen: {n_frozen:,} | Trainable: {n_trainable:,} "
+      f"(last {N_UNFREEZE_BLOCKS} blocks + post-LN)")
+
+vision = vision.to(device).eval()
+
+# ---------------------------------------------------------------------------
+# Stage 3 — End-to-end fusion
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Stage 3 — End-to-End Fusion Training")
+print("=" * 60)
+
+
+class LiveFusionDataset(Dataset):
+    """Per-patient dataset; slices loaded on-the-fly for gradient flow."""
+
+    def __init__(self, root, pids, pid2tabemb, pid2label, pid_lab_mri, tf):
+        self.tf      = tf
+        self.pid2tab = pid2tabemb
+        self.samples = []
+        for pid in pids:
+            if pid not in pid2tabemb or pid not in pid2label:
+                continue
+            folder = os.path.join(root, pid)
+            if not os.path.isdir(folder):
+                continue
+            paths = sorted(glob.glob(os.path.join(folder, "*.png")))
+            if not paths:
+                continue
+            tab_lab = int(pid2label[pid])
+            mri_lab = pid_lab_mri.get(pid)
+            if mri_lab is not None and int(mri_lab) != tab_lab:
+                continue
+            self.samples.append((pid, tab_lab, paths))
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, i):
+        pid, label, paths = self.samples[i]
+        slices = torch.stack([self.tf(Image.open(p).convert("RGB")) for p in paths])
+        return slices, self.pid2tab[pid], label, pid
+
+
+def fusion_collate(batch):
+    slices_list, tab_list, labels, pids = zip(*batch)
+    S = max(s.shape[0] for s in slices_list)
+    C, H, W = slices_list[0].shape[1:]
+    padded   = torch.zeros(len(batch), S, C, H, W)
+    n_slices = []
+    for b, s in enumerate(slices_list):
+        n = s.shape[0]; padded[b, :n] = s; n_slices.append(n)
+    return (
+        padded,
+        torch.stack(tab_list),
+        torch.tensor(labels, dtype=torch.long),
+        pids,
+        torch.tensor(n_slices),
+    )
+
+
+pid2label_tr = dict(zip(train_pids, y_train.tolist()))
+pid2label_va = dict(zip(val_pids,   y_val.tolist()))
+pid2label_te = dict(zip(test_pids,  y_test.tolist()))
+
+tr_ds = LiveFusionDataset(MRI_DIR, train_pids, all_pid2tabemb, pid2label_tr, pid_lab_mri, tf_mri)
+va_ds = LiveFusionDataset(MRI_DIR, val_pids,   all_pid2tabemb, pid2label_va, pid_lab_mri, tf_mri)
+te_ds = LiveFusionDataset(MRI_DIR, test_pids,  all_pid2tabemb, pid2label_te, pid_lab_mri, tf_mri)
+print(f"  Train: {len(tr_ds)} | Val: {len(va_ds)} | Test: {len(te_ds)}")
+
+cc_f   = np.bincount([s[1] for s in tr_ds.samples], minlength=NUM_CLASSES).astype(np.float32)
+samp_f = WeightedRandomSampler([1.0 / max(cc_f[l], 1) for l in [s[1] for s in tr_ds.samples]],
+                                len(tr_ds), replacement=True)
+tr_dl  = DataLoader(tr_ds, batch_size=FUS_BS, sampler=samp_f, collate_fn=fusion_collate,
+                    num_workers=4, pin_memory=True)
+va_dl  = DataLoader(va_ds, batch_size=FUS_BS, shuffle=False, collate_fn=fusion_collate, num_workers=4)
+te_dl  = DataLoader(te_ds, batch_size=FUS_BS, shuffle=False, collate_fn=fusion_collate, num_workers=4)
+
+
+class LabelSmoothedFocalLoss(nn.Module):
+    def __init__(self, num_classes, weight=None, smoothing=0.1, gamma=1.0):
+        super().__init__()
+        self.K = num_classes; self.s = smoothing; self.g = gamma; self.w = weight
+
+    def forward(self, logits, targets):
+        with torch.no_grad():
+            soft = torch.full_like(logits, self.s / (self.K - 1))
+            soft.scatter_(1, targets.unsqueeze(1), 1.0 - self.s)
+        lp   = F.log_softmax(logits, 1)
+        pt   = lp.exp().gather(1, targets.unsqueeze(1)).squeeze(1)
+        loss = (1 - pt).pow(self.g) * -(soft * lp).sum(1)
+        if self.w is not None:
+            loss = self.w[targets] * loss
+        return loss.mean()
+
+
+class FusionModel(nn.Module):
+    """
+    Concatenation-fusion of MRI (512-d) and tabular SupCon (256-d) embeddings.
+
+    MRI branch  : vision pooler [1152] -> Linear -> BN -> GELU -> [512]
+    Tab branch  : SupCon emb   [256]  -> Linear -> BN -> GELU -> [256]
+    Fusion MLP  : [768] -> 512 -> 256 -> num_classes
+    """
+
+    def __init__(self, vision_enc, mri_in=VISION_POOLER_DIM, tab_in=TAB_PROJ_DIM,
+                 mri_out=MRI_PROJ_DIM, tab_out=TAB_PROJ_DIM, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.vision   = vision_enc
+        self.mri_proj = nn.Sequential(
+            nn.Linear(mri_in, mri_out), nn.BatchNorm1d(mri_out), nn.GELU(), nn.Dropout(0.3),
+        )
+        self.tab_proj = nn.Sequential(
+            nn.Linear(tab_in, tab_out), nn.BatchNorm1d(tab_out), nn.GELU(), nn.Dropout(0.2),
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(mri_out + tab_out, 512), nn.BatchNorm1d(512), nn.GELU(), nn.Dropout(0.4),
+            nn.Linear(512, 256),               nn.BatchNorm1d(256), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+
+    def _pool_mri(self, slices, n_slices):
+        B, S, C, H, W = slices.shape
+        pooler = self.vision(slices.view(B * S, C, H, W)).pooler_output.view(B, S, -1)
+        mask   = torch.zeros(B, S, 1, device=pooler.device)
+        for b in range(B):
+            mask[b, :n_slices[b]] = 1.0
+        return (pooler * mask).sum(1) / mask.sum(1).clamp(min=1)
+
+    def forward(self, slices, tab, n_slices):
+        h = torch.cat([self.mri_proj(self._pool_mri(slices, n_slices)),
+                       self.tab_proj(tab)], dim=1)
+        return self.mlp(h)
+
+    def embed(self, slices, tab, n_slices):
+        h = torch.cat([self.mri_proj(self._pool_mri(slices, n_slices)),
+                       self.tab_proj(tab)], dim=1)
+        for layer in list(self.mlp.children())[:-1]:
+            h = layer(h)
+        return h
+
+
+model = FusionModel(vision_enc=vision, tab_in=CFG["tab_fus_dim"]).to(device)
+print(f"  MRI proj: [{VISION_POOLER_DIM}->{MRI_PROJ_DIM}] | "
+      f"Tab proj: [{CFG['tab_fus_dim']}->{TAB_PROJ_DIM}] | "
+      f"Fusion: [768->512->256->{NUM_CLASSES}]")
+
+cw_fus    = 1.0 / np.maximum(cc_f, 1); cw_fus[1] *= MCI_WEIGHT_BOOST
+cw_fus    = torch.tensor(cw_fus / cw_fus.sum() * NUM_CLASSES, dtype=torch.float32).to(device)
+criterion = LabelSmoothedFocalLoss(NUM_CLASSES, weight=cw_fus,
+                                   smoothing=CFG["label_smooth"], gamma=CFG["focal_gamma"])
+
+vision_params = [p for p in model.vision.parameters() if p.requires_grad]
+fusion_params = list(model.mri_proj.parameters()) + \
+                list(model.tab_proj.parameters()) + \
+                list(model.mlp.parameters())
+
+opt_fus = torch.optim.AdamW([
+    {"params": vision_params, "lr": CFG["fus_lr"] * VISION_LR_SCALE},
+    {"params": fusion_params, "lr": CFG["fus_lr"]},
+], weight_decay=0.01)
+
+ws  = len(tr_dl) * 2
+ts  = len(tr_dl) * FUS_EP
+sch_fus = torch.optim.lr_scheduler.LambdaLR(
+    opt_fus,
+    lambda s: s / max(ws, 1) if s < ws
+              else 0.5 * (1 + math.cos(math.pi * (s - ws) / max(ts - ws, 1)))
+)
+scaler_fus = torch.amp.GradScaler("cuda")
+
+
+def eval_fusion(m, loader):
+    m.eval(); m.vision.eval()
+    p_all, l_all = [], []
+    with torch.no_grad(), torch.amp.autocast("cuda"):
+        for slices, tab, labs, _, n_sl in loader:
+            logits = m(slices.to(device), tab.to(device), n_sl.to(device))
+            p_all.append(torch.softmax(logits, 1).cpu().numpy())
+            l_all.extend(labs.tolist())
+    fp = np.concatenate(p_all); fl = np.array(l_all, dtype=int); preds = fp.argmax(1)
+    return dict(accuracy=accuracy_score(fl, preds),
+                f1_macro=f1_score(fl, preds, average="macro", zero_division=0),
+                f1_weight=f1_score(fl, preds, average="weighted", zero_division=0),
+                prec_mac=precision_score(fl, preds, average="macro", zero_division=0),
+                rec_mac=recall_score(fl, preds, average="macro", zero_division=0),
+                mcc=matthews_corrcoef(fl, preds),
+                auroc_ovr=roc_auc_score(fl, fp, multi_class="ovr", average="macro"),
+                confusion=confusion_matrix(fl, preds),
+                probs=fp, labels=fl, preds=preds)
+
+
+best_auc = 0.0; pat = 0
+for ep in range(FUS_EP):
+    model.fusion_train_mode = True
+    model.mlp.train(); model.mri_proj.train(); model.tab_proj.train()
+    model.vision.eval()
+    r_loss = n_b = 0
+    for slices, tab, labs, _, n_sl in tr_dl:
+        slices = slices.to(device, non_blocking=True)
+        tab    = tab.to(device,    non_blocking=True)
+        labs   = labs.long().to(device, non_blocking=True)
+        n_sl   = n_sl.to(device,   non_blocking=True)
+        with torch.amp.autocast("cuda"):
+            loss = criterion(model(slices, tab, n_sl), labs)
+        opt_fus.zero_grad(set_to_none=True)
+        scaler_fus.scale(loss).backward()
+        scaler_fus.unscale_(opt_fus)
+        torch.nn.utils.clip_grad_norm_(vision_params, 0.5)
+        torch.nn.utils.clip_grad_norm_(fusion_params, 1.0)
+        scaler_fus.step(opt_fus); scaler_fus.update(); sch_fus.step()
+        r_loss += loss.item(); n_b += 1
+
+    vm    = eval_fusion(model, va_dl)
+    mci_r = (vm["preds"][vm["labels"]==1]==1).mean() if (vm["labels"]==1).sum() else 0.0
+    print(f"  Ep {ep+1:>2} | loss {r_loss/n_b:.4f} | acc {vm['accuracy']:.4f} | "
+          f"AUROC {vm['auroc_ovr']:.4f} | MCC {vm['mcc']:.4f} | MCI-rec {mci_r:.3f}")
+    if vm["auroc_ovr"] > best_auc:
+        best_auc = vm["auroc_ovr"]
+        torch.save(model.state_dict(), "best_fusion.pth")
+        print(f"         -> best ({best_auc:.4f})"); pat = 0
+    else:
+        pat += 1
+        if pat >= FUS_PAT:
+            print(f"  Early stop at epoch {ep+1}"); break
+
+model.load_state_dict(torch.load("best_fusion.pth"))
+
+va_m = eval_fusion(model, va_dl)
+te_m = eval_fusion(model, te_dl)
+compute_metrics(va_m["labels"], va_m["preds"], va_m["probs"], "Fusion val")
+compute_metrics(te_m["labels"], te_m["preds"], te_m["probs"], "Fusion test")
+
+fus_te_mci = (te_m["preds"][te_m["labels"]==1]==1).mean() if (te_m["labels"]==1).sum() else 0.0
+
+fus_save = os.path.join(OUTPUT_DIR, f"fusion_{RUN_ID}.pth")
+torch.save({"state_dict": model.state_dict(), "cfg": CFG,
+            "best_val_auroc": best_auc,
+            "test": {k: float(te_m[k]) for k in ("accuracy","auroc_ovr","f1_macro","mcc")}},
+           fus_save)
+
+CFG["results"] = {
+    "supcon_tab": {"val_acc": float(sc_va_acc), "test_acc": float(sc_te_acc),
+                   "test_auc": float(sc_te_auc), "test_mci_recall": float(sc_te_mci)},
+    "fusion":     {"val_acc": float(va_m["accuracy"]), "val_auc": float(va_m["auroc_ovr"]),
+                   "test_acc": float(te_m["accuracy"]), "test_auc": float(te_m["auroc_ovr"]),
+                   "test_f1": float(te_m["f1_macro"]),  "test_mcc": float(te_m["mcc"]),
+                   "test_mci_recall": float(fus_te_mci),
+                   "delta_acc": float(te_m["accuracy"] - sc_te_acc),
+                   "delta_auc": float(te_m["auroc_ovr"] - sc_te_auc),
+                   "delta_mci": float(fus_te_mci - sc_te_mci)},
+}
+cfg_path = os.path.join(OUTPUT_DIR, f"config_{RUN_ID}.json")
+with open(cfg_path, "w") as f:
+    json.dump(CFG, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# t-SNE — fusion embeddings, CN vs AD
+# ---------------------------------------------------------------------------
+print("\nGenerating t-SNE ...")
+
+model.eval(); model.vision.eval()
+
+
+def get_embeds(loader):
+    embs, labs = [], []
+    with torch.no_grad(), torch.amp.autocast("cuda"):
+        for slices, tab, lab, _, n_sl in loader:
+            h = model.embed(slices.to(device), tab.to(device), n_sl.to(device))
+            embs.append(h.cpu().float().numpy()); labs.extend(lab.tolist())
+    return np.concatenate(embs), np.array(labs, dtype=int)
+
+
+def cn_ad(e, l):
+    m = (l == 0) | (l == 2); return e[m], l[m]
+
+
+tr_e, tr_l = cn_ad(*get_embeds(tr_dl))
+va_e, va_l = cn_ad(*get_embeds(va_dl))
+te_e, te_l = cn_ad(*get_embeds(te_dl))
+
+all_e  = np.concatenate([tr_e, va_e, te_e])
+all_l  = np.concatenate([tr_l, va_l, te_l])
+splits = ["train"] * len(tr_e) + ["val"] * len(va_e) + ["test"] * len(te_e)
+
+coords = TSNE(n_components=2, perplexity=30, random_state=SEED,
+              n_iter=1000, learning_rate="auto", init="pca").fit_transform(all_e)
+
+CN_COLOR = "#6A9FD8"; AD_COLOR = "#E8956A"
+markers  = {"train": "o", "val": "s", "test": "^"}
+sizes    = {"train": 45,  "val": 55,  "test": 55}
+
+fig, ax = plt.subplots(figsize=(10, 8))
+ax.set_facecolor("white"); fig.patch.set_facecolor("white")
+ax.grid(True, color="#e0e0e0", lw=0.6, zorder=0); ax.set_axisbelow(True)
+
+for sp in ["train", "val", "test"]:
+    ms = np.array(splits) == sp
+    for cls, col, cn in [(0, CN_COLOR, "CN"), (2, AD_COLOR, "AD")]:
+        m = ms & (all_l == cls)
+        if m.sum():
+            ax.scatter(coords[m, 0], coords[m, 1], c=col, marker=markers[sp],
+                       s=sizes[sp], alpha=0.82, lw=0.3, edgecolors="white", zorder=3)
+
+ax.set_title("t-SNE: Fusion Embeddings (CN vs AD)", fontsize=14, fontweight="bold", pad=14)
+ax.set_xlabel("t-SNE 1", fontsize=11); ax.set_ylabel("t-SNE 2", fontsize=11)
+handles = [plt.scatter([], [], c=col, marker=mk, s=50, alpha=0.85, lw=0.3,
+                       edgecolors="white", label=f"{cn} ({sp})")
+           for sp, mk in markers.items()
+           for cls, col, cn in [(0, CN_COLOR, "CN"), (2, AD_COLOR, "AD")]]
+ax.legend(handles=handles, loc="upper right", framealpha=0.9, fontsize=9)
+plt.tight_layout()
+tsne_path = os.path.join(OUTPUT_DIR, f"tsne_{RUN_ID}.png")
+plt.savefig(tsne_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 65)
+print(f"  Summary — {RUN_ID}")
+print("=" * 65)
+print(f"\n{'Model':<30} {'Val Acc':>8} {'Test Acc':>9} {'Test AUC':>9}")
+print("-" * 60)
+print(f"{'SupCon-Tab':<30} {sc_va_acc:>8.4f} {sc_te_acc:>9.4f} {sc_te_auc:>9.4f}")
+print(f"{'Fusion':<30} {va_m['accuracy']:>8.4f} {te_m['accuracy']:>9.4f} {te_m['auroc_ovr']:>9.4f}")
+print("-" * 60)
+print(f"\n{'Model':<30} {'CN':>6} {'MCI':>6} {'AD':>6}  (per-class recall, test)")
+print("-" * 54)
+for name, pr, la in [("SupCon-Tab", sc_te_pr, sc_te_fl),
+                     ("Fusion",     te_m["preds"], te_m["labels"])]:
+    r = [(pr[la==c]==c).mean() if (la==c).sum() else 0.0 for c in range(3)]
+    print(f"  {name:<28} {r[0]:>6.3f} {r[1]:>6.3f} {r[2]:>6.3f}")
+print(f"\n  Delta Acc: {te_m['accuracy']-sc_te_acc:+.4f} | "
+      f"Delta AUC: {te_m['auroc_ovr']-sc_te_auc:+.4f} | "
+      f"Delta MCI: {fus_te_mci-sc_te_mci:+.3f}")
+print(f"\n  Outputs:")
+print(f"    {sc_save}\n    {fus_save}\n    {cfg_path}\n    {tsne_path}")
+print("=" * 65)
